@@ -513,13 +513,13 @@ class GenerationHandler:
             if generation_type == "image":
                 debug_logger.log_info(f"[GENERATION] 开始图片生成流程...")
                 async for chunk in self._handle_image_generation(
-                    token, project_id, model_config, prompt, images, stream
+                    token, project_id, model_config, prompt, images, stream, model
                 ):
                     yield chunk
             else:  # video
                 debug_logger.log_info(f"[GENERATION] 开始视频生成流程...")
                 async for chunk in self._handle_video_generation(
-                    token, project_id, model_config, prompt, images, stream
+                    token, project_id, model_config, prompt, images, stream, model
                 ):
                     yield chunk
 
@@ -577,7 +577,8 @@ class GenerationHandler:
         model_config: dict,
         prompt: str,
         images: Optional[List[bytes]],
-        stream: bool
+        stream: bool,
+        model: str = "flow2api"
     ) -> AsyncGenerator:
         """处理图片生成 (同步返回)"""
 
@@ -653,12 +654,14 @@ class GenerationHandler:
             if stream:
                 yield self._create_stream_chunk(
                     f"![Generated Image]({local_url})",
-                    finish_reason="stop"
+                    finish_reason="stop",
+                    model=model
                 )
             else:
                 yield self._create_completion_response(
                     local_url,  # 直接传URL,让方法内部格式化
-                    media_type="image"
+                    media_type="image",
+                    model=model
                 )
 
         finally:
@@ -673,7 +676,8 @@ class GenerationHandler:
         model_config: dict,
         prompt: str,
         images: Optional[List[bytes]],
-        stream: bool
+        stream: bool,
+        model: str = "flow2api"
     ) -> AsyncGenerator:
         """处理视频生成 (异步轮询)"""
 
@@ -837,9 +841,9 @@ class GenerationHandler:
 
             # 轮询结果
             if stream:
-                yield self._create_stream_chunk(f"视频生成中...\n")
+                yield self._create_stream_chunk(f"视频生成中...\n", model=model)
 
-            async for chunk in self._poll_video_result(token, operations, stream):
+            async for chunk in self._poll_video_result(token, operations, stream, model):
                 yield chunk
 
         finally:
@@ -851,7 +855,8 @@ class GenerationHandler:
         self,
         token,
         operations: List[Dict],
-        stream: bool
+        stream: bool,
+        model: str = "flow2api"
     ) -> AsyncGenerator:
         """轮询视频生成结果"""
 
@@ -922,12 +927,14 @@ class GenerationHandler:
                     if stream:
                         yield self._create_stream_chunk(
                             f"<video src='{local_url}' controls style='max-width:100%'></video>",
-                            finish_reason="stop"
+                            finish_reason="stop",
+                            model=model
                         )
                     else:
                         yield self._create_completion_response(
                             local_url,  # 直接传URL,让方法内部格式化
-                            media_type="video"
+                            media_type="video",
+                            model=model
                         )
                     return
 
@@ -945,8 +952,15 @@ class GenerationHandler:
 
     # ========== 响应格式化 ==========
 
-    def _create_stream_chunk(self, content: str, role: str = None, finish_reason: str = None) -> str:
-        """创建流式响应chunk"""
+    def _create_stream_chunk(self, content: str, role: str = None, finish_reason: str = None, model: str = "flow2api") -> str:
+        """创建流式响应chunk
+
+        Args:
+            content: 响应内容
+            role: 角色
+            finish_reason: 结束原因
+            model: 模型名称，默认为 flow2api
+        """
         import json
         import time
 
@@ -954,7 +968,7 @@ class GenerationHandler:
             "id": f"chatcmpl-{int(time.time())}",
             "object": "chat.completion.chunk",
             "created": int(time.time()),
-            "model": "flow2api",
+            "model": model,
             "choices": [{
                 "index": 0,
                 "delta": {},
@@ -972,13 +986,14 @@ class GenerationHandler:
 
         return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
-    def _create_completion_response(self, content: str, media_type: str = "image", is_availability_check: bool = False) -> str:
+    def _create_completion_response(self, content: str, media_type: str = "image", is_availability_check: bool = False, model: str = "flow2api") -> str:
         """创建非流式响应
 
         Args:
             content: 媒体URL或纯文本消息
             media_type: 媒体类型 ("image" 或 "video")
             is_availability_check: 是否为可用性检查响应 (纯文本消息)
+            model: 模型名称，默认为 flow2api
 
         Returns:
             JSON格式的响应
@@ -1000,7 +1015,7 @@ class GenerationHandler:
             "id": f"chatcmpl-{int(time.time())}",
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": "flow2api",
+            "model": model,
             "choices": [{
                 "index": 0,
                 "message": {
