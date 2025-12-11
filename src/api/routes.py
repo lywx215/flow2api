@@ -1,13 +1,14 @@
 """API routes - OpenAI compatible endpoints"""
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form
 from fastapi.responses import StreamingResponse, JSONResponse
-from typing import List
+from typing import List, Optional
 import base64
 import re
 import json
+import time
 from ..core.auth import verify_api_key_header
-from ..core.models import ChatCompletionRequest
-from ..services.generation_handler import GenerationHandler, MODEL_CONFIG
+from ..core.models import ChatCompletionRequest, ImageGenerationRequest, ImageResponse, ImageResponseData
+from ..services.generation_handler import GenerationHandler, MODEL_CONFIG, IMAGE_MODELS, map_openai_model_to_internal
 
 router = APIRouter()
 
@@ -44,6 +45,112 @@ async def list_models(api_key: str = Depends(verify_api_key_header)):
         "object": "list",
         "data": models
     }
+
+
+@router.post("/v1/images/generations")
+async def create_image_generation(
+    request: ImageGenerationRequest,
+    api_key: str = Depends(verify_api_key_header)
+):
+    """Create image from text prompt (OpenAI Images API compatible)
+
+    支持的参数:
+    - prompt: 图片描述
+    - model: dall-e-3, dall-e-2, gpt-image-1 或内部模型名
+    - size: 1024x1024, 1792x1024, 1024x1792
+    - response_format: url 或 b64_json
+    - n: 生成数量 (目前只支持1)
+    """
+    try:
+        # 将 OpenAI 模型名映射到内部模型
+        internal_model = map_openai_model_to_internal(
+            request.model or "dall-e-3",
+            request.size or "1024x1024"
+        )
+
+        # 调用生成方法
+        result = await generation_handler.handle_image_generation_simple(
+            model=internal_model,
+            prompt=request.prompt,
+            images=None,  # generations 不使用图片输入
+            response_format=request.response_format or "url"
+        )
+
+        # 构造 OpenAI 格式响应
+        response = ImageResponse(
+            created=int(time.time()),
+            data=[ImageResponseData(
+                url=result.get("url"),
+                b64_json=result.get("b64_json"),
+                revised_prompt=result.get("revised_prompt")
+            )]
+        )
+
+        return response.model_dump(exclude_none=True)
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/v1/images/edits")
+async def create_image_edit(
+    image: UploadFile = File(...),
+    prompt: str = Form(...),
+    model: str = Form("dall-e-2"),
+    n: int = Form(1),
+    size: str = Form("1024x1024"),
+    response_format: str = Form("url"),
+    mask: Optional[UploadFile] = File(None),
+    api_key: str = Depends(verify_api_key_header)
+):
+    """Edit image based on prompt (OpenAI Images API compatible)
+
+    支持的参数:
+    - image: 要编辑的图片 (multipart/form-data)
+    - prompt: 编辑描述
+    - model: dall-e-2, gpt-image-1 或内部模型名
+    - size: 1024x1024, 1792x1024, 1024x1792
+    - response_format: url 或 b64_json
+    - mask: 可选的蒙版图片
+    """
+    try:
+        # 读取上传的图片
+        image_bytes = await image.read()
+        images = [image_bytes]
+
+        # 如果有蒙版，也读取它（目前不使用，保留兼容性）
+        if mask:
+            await mask.read()
+
+        # 将 OpenAI 模型名映射到内部模型
+        internal_model = map_openai_model_to_internal(model, size)
+
+        # 调用生成方法
+        result = await generation_handler.handle_image_generation_simple(
+            model=internal_model,
+            prompt=prompt,
+            images=images,
+            response_format=response_format
+        )
+
+        # 构造 OpenAI 格式响应
+        response = ImageResponse(
+            created=int(time.time()),
+            data=[ImageResponseData(
+                url=result.get("url"),
+                b64_json=result.get("b64_json"),
+                revised_prompt=result.get("revised_prompt")
+            )]
+        )
+
+        return response.model_dump(exclude_none=True)
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/v1/chat/completions")
@@ -145,3 +252,4 @@ async def create_chat_completion(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+

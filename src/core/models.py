@@ -157,3 +157,31 @@ class ChatCompletionRequest(BaseModel):
     # Flow2API specific parameters
     image: Optional[str] = None  # Base64 encoded image (deprecated, use messages)
     video: Optional[str] = None  # Base64 encoded video (deprecated)
+
+
+# ========== OpenAI Images API Models ==========
+
+class ImageGenerationRequest(BaseModel):
+    """OpenAI Images generations request (/v1/images/generations)"""
+    prompt: str
+    model: Optional[str] = "dall-e-3"  # 映射到内部模型
+    n: int = 1  # 生成数量 (目前只支持1)
+    size: Optional[str] = "1024x1024"  # 1024x1024, 1792x1024, 1024x1792
+    response_format: Optional[str] = "url"  # url 或 b64_json
+    quality: Optional[str] = "standard"  # standard 或 hd
+    style: Optional[str] = None  # vivid 或 natural
+    user: Optional[str] = None
+
+
+class ImageResponseData(BaseModel):
+    """Single image in OpenAI Images API response"""
+    url: Optional[str] = None
+    b64_json: Optional[str] = None
+    revised_prompt: Optional[str] = None
+
+
+class ImageResponse(BaseModel):
+    """OpenAI Images API response"""
+    created: int
+    data: List[ImageResponseData]
+

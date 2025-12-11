@@ -50,7 +50,7 @@ class LoadBalancer:
                 continue
 
             # Filter for gemini-3.0 models (skip free tier tokens)
-            if model and model in ["gemini-3.0-pro-image-landscape", "gemini-3.0-pro-image-portrait"]:
+            if model and model in ["gemini-3-pro-image-landscape", "gemini-3-pro-image-portrait"]:
                 if token.user_paygate_tier == "PAYGATE_TIER_NOT_PAID":
                     filtered_reasons[token.id] = "gemini-3.0模型不支持普通账号"
                     continue

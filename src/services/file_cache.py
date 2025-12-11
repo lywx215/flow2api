@@ -162,6 +162,45 @@ class FileCache:
             )
             raise Exception(f"Failed to cache file: {str(e)}")
 
+    async def download_file(self, url: str) -> bytes:
+        """
+        Download file from URL and return raw bytes (no caching)
+
+        Args:
+            url: File URL to download
+
+        Returns:
+            File content as bytes
+        """
+        debug_logger.log_info(f"Downloading file from: {url}")
+
+        try:
+            # Get proxy if available
+            proxy_url = None
+            if self.proxy_manager:
+                proxy_config = await self.proxy_manager.get_proxy_config()
+                if proxy_config and proxy_config.enabled and proxy_config.proxy_url:
+                    proxy_url = proxy_config.proxy_url
+
+            # Download with proxy support
+            async with AsyncSession() as session:
+                proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+                response = await session.get(url, timeout=60, proxies=proxies)
+
+                if response.status_code != 200:
+                    raise Exception(f"Download failed: HTTP {response.status_code}")
+
+                debug_logger.log_info(f"File downloaded: {len(response.content)} bytes")
+                return response.content
+
+        except Exception as e:
+            debug_logger.log_error(
+                error_message=f"Failed to download file: {str(e)}",
+                status_code=0,
+                response_text=str(e)
+            )
+            raise Exception(f"Failed to download file: {str(e)}")
+
     def get_cache_path(self, filename: str) -> Path:
         """Get full path to cached file"""
         return self.cache_dir / filename

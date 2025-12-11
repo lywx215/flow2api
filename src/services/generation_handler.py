@@ -25,12 +25,12 @@ MODEL_CONFIG = {
     },
 
     # 图片生成 - GEM_PIX_2 (Gemini 3.0 Pro)
-    "gemini-3.0-pro-image-landscape": {
+    "gemini-3-pro-image-landscape": {
         "type": "image",
         "model_name": "GEM_PIX_2",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE"
     },
-    "gemini-3.0-pro-image-portrait": {
+    "gemini-3-pro-image-portrait": {
         "type": "image",
         "model_name": "GEM_PIX_2",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT"
@@ -189,6 +189,46 @@ MODEL_CONFIG = {
     }
 }
 
+# 图片模型列表 (用于 Images API)
+IMAGE_MODELS = [k for k, v in MODEL_CONFIG.items() if v["type"] == "image"]
+
+
+def map_openai_model_to_internal(openai_model: str, size: str = "1024x1024") -> str:
+    """将 OpenAI 模型名映射到内部模型
+
+    Args:
+        openai_model: dall-e-2, dall-e-3, gpt-image-1 或内部模型名
+        size: 1024x1024, 1792x1024, 1024x1792 等
+
+    Returns:
+        内部模型名如 gemini-2.5-flash-image-landscape
+    """
+    # 如果已经是内部模型名，直接返回
+    if openai_model in MODEL_CONFIG:
+        return openai_model
+
+    # 解析尺寸确定方向
+    orientation = "landscape"  # 默认横屏
+    if size:
+        parts = size.lower().split("x")
+        if len(parts) == 2:
+            try:
+                width, height = int(parts[0]), int(parts[1])
+                if height > width:
+                    orientation = "portrait"
+            except ValueError:
+                pass
+
+    # 模型映射
+    model_mapping = {
+        "dall-e-3": "gemini-2.5-flash-image",
+        "dall-e-2": "gemini-2.5-flash-image",
+        "gpt-image-1": "gemini-2.5-flash-image",
+    }
+
+    base_model = model_mapping.get(openai_model.lower(), "gemini-2.5-flash-image")
+    return f"{base_model}-{orientation}"
+
 
 class GenerationHandler:
     """统一生成处理器"""
@@ -220,6 +260,157 @@ class GenerationHandler:
             for_video_generation=is_video
         )
         return token_obj is not None
+
+    async def handle_image_generation_simple(
+        self,
+        model: str,
+        prompt: str,
+        images: Optional[List[bytes]] = None,
+        response_format: str = "url"
+    ) -> Dict[str, Any]:
+        """简化的图片生成方法，用于 Images API
+
+        Args:
+            model: 内部模型名称 (如 gemini-2.5-flash-image-landscape)
+            prompt: 提示词
+            images: 图片列表 (bytes格式，用于图生图)
+            response_format: 返回格式 "url" 或 "b64_json"
+
+        Returns:
+            {
+                "url": "...",           # 如果 response_format == "url"
+                "b64_json": "...",      # 如果 response_format == "b64_json"
+                "revised_prompt": None
+            }
+
+        Raises:
+            Exception: 生成失败时抛出异常
+        """
+        start_time = time.time()
+
+        # 1. 验证模型
+        if model not in MODEL_CONFIG:
+            raise ValueError(f"不支持的模型: {model}")
+
+        model_config = MODEL_CONFIG[model]
+        if model_config["type"] != "image":
+            raise ValueError(f"模型 {model} 不是图片生成模型")
+
+        debug_logger.log_info(f"[IMAGES_API] 开始生成 - 模型: {model}, Prompt: {prompt[:50]}...")
+
+        # 2. 选择 Token
+        token = await self.load_balancer.select_token(for_image_generation=True, model=model)
+        if not token:
+            raise Exception("没有可用的Token进行图片生成")
+
+        debug_logger.log_info(f"[IMAGES_API] 已选择Token: {token.id} ({token.email})")
+
+        try:
+            # 3. 确保 AT 有效
+            if not await self.token_manager.is_at_valid(token.id):
+                raise Exception("Token AT无效或刷新失败")
+
+            token = await self.token_manager.get_token(token.id)
+
+            # 4. 确保 Project 存在
+            project_id = await self.token_manager.ensure_project_exists(token.id)
+
+            # 5. 获取并发槽位
+            if self.concurrency_manager:
+                if not await self.concurrency_manager.acquire_image(token.id):
+                    raise Exception("图片并发限制已达上限")
+
+            try:
+                # 6. 上传图片 (如果有)
+                image_inputs = []
+                if images and len(images) > 0:
+                    for image_bytes in images:
+                        media_id = await self.flow_client.upload_image(
+                            token.at,
+                            image_bytes,
+                            model_config["aspect_ratio"]
+                        )
+                        image_inputs.append({
+                            "name": media_id,
+                            "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE"
+                        })
+
+                # 7. 调用生成 API
+                result = await self.flow_client.generate_image(
+                    at=token.at,
+                    project_id=project_id,
+                    prompt=prompt,
+                    model_name=model_config["model_name"],
+                    aspect_ratio=model_config["aspect_ratio"],
+                    image_inputs=image_inputs
+                )
+
+                # 8. 提取结果
+                media = result.get("media", [])
+                if not media:
+                    raise Exception("生成结果为空")
+
+                image_url = media[0]["image"]["generatedImage"]["fifeUrl"]
+
+                # 9. 处理返回格式
+                response_data = {"revised_prompt": None}
+
+                if response_format == "b64_json":
+                    # 下载图片并转换为 base64
+                    debug_logger.log_info(f"[IMAGES_API] 下载图片转换为 base64...")
+                    image_bytes = await self.file_cache.download_file(image_url)
+                    response_data["b64_json"] = base64.b64encode(image_bytes).decode("utf-8")
+                else:
+                    # 返回 URL (使用缓存)
+                    if config.cache_enabled:
+                        try:
+                            cached_filename = await self.file_cache.download_and_cache(image_url, "image")
+                            response_data["url"] = f"{self._get_base_url()}/tmp/{cached_filename}"
+                        except Exception as e:
+                            debug_logger.log_error(f"缓存失败: {str(e)}")
+                            response_data["url"] = image_url
+                    else:
+                        response_data["url"] = image_url
+
+                # 10. 记录使用
+                await self.token_manager.record_usage(token.id, is_video=False)
+                await self.token_manager.record_success(token.id)
+
+                # 11. 记录日志
+                duration = time.time() - start_time
+                await self._log_request(
+                    token.id,
+                    "images_generation",
+                    {"model": model, "prompt": prompt[:100], "has_images": bool(images)},
+                    {"status": "success"},
+                    200,
+                    duration
+                )
+
+                debug_logger.log_info(f"[IMAGES_API] ✅ 生成成功完成")
+                return response_data
+
+            finally:
+                # 释放并发槽位
+                if self.concurrency_manager:
+                    await self.concurrency_manager.release_image(token.id)
+
+        except Exception as e:
+            # 记录错误
+            if token:
+                await self.token_manager.record_error(token.id)
+
+            duration = time.time() - start_time
+            await self._log_request(
+                token.id if token else None,
+                "images_generation",
+                {"model": model, "prompt": prompt[:100], "has_images": bool(images)},
+                {"error": str(e)},
+                500,
+                duration
+            )
+            raise
+
 
     async def handle_generation(
         self,

@@ -95,8 +95,8 @@ python main.py
 |---------|--------|--------|
 | `gemini-2.5-flash-image-landscape` | 图/文生图 | 横屏 |
 | `gemini-2.5-flash-image-portrait` | 图/文生图 | 竖屏 |
-| `gemini-3.0-pro-image-landscape` | 图/文生图 | 横屏 |
-| `gemini-3.0-pro-image-portrait` | 图/文生图 | 竖屏 |
+| `gemini-3-pro-image-landscape` | 图/文生图 | 横屏 |
+| `gemini-3-pro-image-portrait` | 图/文生图 | 竖屏 |
 | `imagen-4.0-generate-preview-landscape` | 图/文生图 | 横屏 |
 | `imagen-4.0-generate-preview-portrait` | 图/文生图 | 竖屏 |
 
@@ -134,9 +134,61 @@ python main.py
 | `veo_3_0_r2v_fast_portrait` | 图生视频 | 竖屏 |
 | `veo_3_0_r2v_fast_landscape` | 图生视频 | 横屏 |
 
-## 📡 API 使用示例（需要使用流式）
+## 📡 API 使用示例
 
-### 文生图
+### OpenAI Images API
+
+支持标准 OpenAI Images API 格式，可直接使用 OpenAI SDK 调用。
+
+#### 文生图 (POST /v1/images/generations)
+
+```bash
+curl -X POST "http://localhost:8000/v1/images/generations" \
+  -H "Authorization: Bearer han1234" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "一只可爱的猫咪在花园里玩耍",
+    "model": "dall-e-3",
+    "size": "1024x1024",
+    "response_format": "url"
+  }'
+```
+
+#### 图生图 (POST /v1/images/edits)
+
+```bash
+curl -X POST "http://localhost:8000/v1/images/edits" \
+  -H "Authorization: Bearer han1234" \
+  -F "image=@input.png" \
+  -F "prompt=将这张图片变成水彩画风格" \
+  -F "size=1024x1024"
+```
+
+#### 使用 OpenAI Python SDK
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="han1234",
+    base_url="http://localhost:8000/v1"
+)
+
+# 文生图
+response = client.images.generate(
+    model="dall-e-3",
+    prompt="一只可爱的猫咪",
+    size="1024x1024"
+)
+print(response.data[0].url)
+```
+
+---
+
+### Chat Completions API（需要使用流式）
+
+#### 文生图
+
 
 ```bash
 curl -X POST "http://localhost:8000/v1/chat/completions" \
