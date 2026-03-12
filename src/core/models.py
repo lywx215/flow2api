@@ -293,5 +293,9 @@ class ChatCompletionRequest(BaseModel):
     # Gemini extension parameters (from extra_body or top-level)
     generationConfig: Optional[GenerationConfigParam] = None
     contents: Optional[List[Any]] = None  # Gemini native contents
+    # 集约模型参数
+    aspect_ratio: Optional[str] = None      # "16:9","9:16","1:1","4:3","3:4","landscape","portrait"
+    resolution: Optional[str] = None        # "1K","2K","4K","1080p","4k"
+    response_format: Optional[str] = None   # "b64_json"(默认) / "url"
 
     model_config = ConfigDict(extra="allow")  # Allow extra fields like extra_body passthrough

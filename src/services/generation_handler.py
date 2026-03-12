@@ -18,7 +18,165 @@ from ..core.account_tiers import (
 from .file_cache import FileCache
 
 
-# Model configuration
+# ==================== 集约模型定义 ====================
+
+# 集约图片模型名 → 内部 model_name
+COMPACT_IMAGE_MODELS = {
+    "gemini-2.5-flash-image": "GEM_PIX",
+    "gemini-3.0-pro-image": "GEM_PIX_2",
+    "gemini-3.1-flash-image": "NARWHAL",
+    "imagen-4.0-generate-preview": "IMAGEN_3_5",
+}
+
+# 集约视频模型名 → {video_type, base_key}
+COMPACT_VIDEO_MODELS = {
+    # T2V
+    "veo-3.1-fast":                   {"video_type": "t2v", "base_key": "veo_3_1_t2v_fast"},
+    "veo-3.1-fast-ultra":             {"video_type": "t2v", "base_key": "veo_3_1_t2v_fast_ultra"},
+    "veo-3.1-fast-ultra-relaxed":     {"video_type": "t2v", "base_key": "veo_3_1_t2v_fast_ultra_relaxed"},
+    "veo-3.1":                        {"video_type": "t2v", "base_key": "veo_3_1_t2v"},
+    "veo-2.1":                        {"video_type": "t2v", "base_key": "veo_2_1_fast_d_15_t2v"},
+    "veo-2.0":                        {"video_type": "t2v", "base_key": "veo_2_0_t2v"},
+    # I2V
+    "veo-3.1-i2v":                    {"video_type": "i2v", "base_key": "veo_3_1_i2v_s_fast"},
+    "veo-3.1-i2v-ultra":              {"video_type": "i2v", "base_key": "veo_3_1_i2v_s_fast_ultra"},
+    "veo-3.1-i2v-ultra-relaxed":      {"video_type": "i2v", "base_key": "veo_3_1_i2v_s_fast_ultra_relaxed"},
+    "veo-3.1-i2v-standard":           {"video_type": "i2v", "base_key": "veo_3_1_i2v_s"},
+    "veo-2.1-i2v":                    {"video_type": "i2v", "base_key": "veo_2_1_fast_d_15_i2v"},
+    "veo-2.0-i2v":                    {"video_type": "i2v", "base_key": "veo_2_0_i2v"},
+    # R2V
+    "veo-3.1-r2v":                    {"video_type": "r2v", "base_key": "veo_3_1_r2v_fast"},
+    "veo-3.1-r2v-ultra":              {"video_type": "r2v", "base_key": "veo_3_1_r2v_fast_ultra"},
+    "veo-3.1-r2v-ultra-relaxed":      {"video_type": "r2v", "base_key": "veo_3_1_r2v_fast_ultra_relaxed"},
+}
+
+# Gemini aspectRatio → 内部常量
+ASPECT_RATIO_MAP_IMAGE = {
+    "16:9": "IMAGE_ASPECT_RATIO_LANDSCAPE",
+    "9:16": "IMAGE_ASPECT_RATIO_PORTRAIT",
+    "1:1":  "IMAGE_ASPECT_RATIO_SQUARE",
+    "4:3":  "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE",
+    "3:4":  "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR",
+    # 兼容关键词
+    "landscape": "IMAGE_ASPECT_RATIO_LANDSCAPE",
+    "portrait":  "IMAGE_ASPECT_RATIO_PORTRAIT",
+    "square":    "IMAGE_ASPECT_RATIO_SQUARE",
+}
+
+ASPECT_RATIO_MAP_VIDEO = {
+    "16:9": "VIDEO_ASPECT_RATIO_LANDSCAPE",
+    "9:16": "VIDEO_ASPECT_RATIO_PORTRAIT",
+    "landscape": "VIDEO_ASPECT_RATIO_LANDSCAPE",
+    "portrait":  "VIDEO_ASPECT_RATIO_PORTRAIT",
+}
+
+# imageSize → upsample
+IMAGE_SIZE_MAP = {
+    "1k": None,
+    "2k": "UPSAMPLE_IMAGE_RESOLUTION_2K",
+    "4k": "UPSAMPLE_IMAGE_RESOLUTION_4K",
+}
+
+# 视频分辨率 → upsample config
+VIDEO_RESOLUTION_MAP = {
+    "1080p": {"resolution": "VIDEO_RESOLUTION_1080P", "model_key": "veo_3_1_upsampler_1080p"},
+    "4k":    {"resolution": "VIDEO_RESOLUTION_4K", "model_key": "veo_3_1_upsampler_4k"},
+}
+
+# 响应格式
+RESPONSE_FORMAT_B64 = "b64_json"
+RESPONSE_FORMAT_URL = "url"
+
+
+def resolve_compact_model(
+    model: str,
+    aspect_ratio: Optional[str] = None,
+    resolution: Optional[str] = None,
+) -> tuple:
+    """将集约模型名 + 参数 → 解析为 (resolved_key, model_config_dict)。
+
+    如果 model 已在 MODEL_CONFIG 中，直接返回。
+    如果 model 是集约模型名，动态构建 config。
+    否则返回 (None, None)。
+    """
+    # 1. 已在 MODEL_CONFIG 中 → 直接返回
+    if model in MODEL_CONFIG:
+        return model, MODEL_CONFIG[model]
+
+    ar_lower = (aspect_ratio or "").strip().lower()
+    res_lower = (resolution or "").strip().lower()
+
+    # 2. 集约图片模型
+    if model in COMPACT_IMAGE_MODELS:
+        model_name = COMPACT_IMAGE_MODELS[model]
+        internal_ar = ASPECT_RATIO_MAP_IMAGE.get(ar_lower or "16:9", "IMAGE_ASPECT_RATIO_LANDSCAPE")
+        upsample = IMAGE_SIZE_MAP.get(res_lower) if res_lower else None
+        cfg = {
+            "type": "image",
+            "model_name": model_name,
+            "aspect_ratio": internal_ar,
+        }
+        if upsample:
+            cfg["upsample"] = upsample
+        resolved_key = f"{model}__resolved"
+        return resolved_key, cfg
+
+    # 3. 集约视频模型
+    if model in COMPACT_VIDEO_MODELS:
+        video_def = COMPACT_VIDEO_MODELS[model]
+        video_type = video_def["video_type"]
+        base_key = video_def["base_key"]
+
+        # 确定横竖屏
+        is_portrait = ar_lower in ("9:16", "portrait")
+        video_ar = "VIDEO_ASPECT_RATIO_PORTRAIT" if is_portrait else "VIDEO_ASPECT_RATIO_LANDSCAPE"
+
+        # 构建上游 model_key
+        if video_type == "r2v":
+            # R2V 模型横屏用 _landscape 后缀
+            if is_portrait:
+                model_key = f"{base_key}_portrait"
+            else:
+                model_key = f"{base_key}_landscape"
+        elif video_type == "i2v":
+            # I2V 模型
+            if is_portrait:
+                model_key = f"{base_key}_portrait_fl"
+            else:
+                model_key = f"{base_key}_fl"
+        else:
+            # T2V 模型
+            if is_portrait:
+                model_key = f"{base_key}_portrait"
+            else:
+                model_key = base_key
+
+        cfg = {
+            "type": "video",
+            "video_type": video_type,
+            "model_key": model_key,
+            "aspect_ratio": video_ar,
+            "supports_images": video_type in ("i2v", "r2v"),
+        }
+        if video_type == "i2v":
+            cfg["min_images"] = 1
+            cfg["max_images"] = 2
+        elif video_type == "r2v":
+            cfg["min_images"] = 0
+            cfg["max_images"] = 3
+
+        # 视频放大
+        if res_lower and res_lower in VIDEO_RESOLUTION_MAP:
+            cfg["upsample"] = VIDEO_RESOLUTION_MAP[res_lower]
+
+        resolved_key = f"{model}__resolved"
+        return resolved_key, cfg
+
+    # 4. 未知模型
+    return None, None
+
+
+# ==================== Model configuration ====================
 MODEL_CONFIG = {
     # 图片生成 - GEM_PIX (Gemini 2.5 Flash)
     "gemini-2.5-flash-image-landscape": {
@@ -776,15 +934,19 @@ class GenerationHandler:
         prompt: str,
         images: Optional[List[bytes]] = None,
         stream: bool = False,
-        base_url_override: Optional[str] = None
+        base_url_override: Optional[str] = None,
+        aspect_ratio: Optional[str] = None,
+        resolution: Optional[str] = None,
     ) -> AsyncGenerator:
         """统一生成入口
 
         Args:
-            model: 模型名称
+            model: 模型名称（支持集约模型名或完整模型名）
             prompt: 提示词
             images: 图片列表 (bytes格式)
             stream: 是否流式输出
+            aspect_ratio: 集约模型的宽高比参数
+            resolution: 集约模型的分辨率参数
         """
         start_time = time.time()
         token = None
@@ -805,14 +967,13 @@ class GenerationHandler:
         if hasattr(self.flow_client, "clear_request_fingerprint"):
             self.flow_client.clear_request_fingerprint()
 
-        # 1. 验证模型
-        if model not in MODEL_CONFIG:
+        # 1. 验证模型（支持集约模型名解析）
+        resolved_key, model_config = resolve_compact_model(model, aspect_ratio, resolution)
+        if not model_config:
             error_msg = f"不支持的模型: {model}"
             debug_logger.log_error(error_msg)
             yield self._create_error_response(error_msg, status_code=400)
             return
-
-        model_config = MODEL_CONFIG[model]
         generation_type = model_config["type"]
         request_operation = f"generate_{generation_type}"
         prompt_for_log = prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
