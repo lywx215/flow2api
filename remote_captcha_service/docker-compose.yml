@@ -15,8 +15,8 @@ services:
       - HOST=0.0.0.0
       - MAX_BROWSERS=${MAX_BROWSERS:-2}
       - SESSION_TIMEOUT=${SESSION_TIMEOUT:-1800}
-      # Kookeey 住宅代理网关（每次连接自动切换 IP）
-      - BROWSER_PROXY_URL=${BROWSER_PROXY_URL:-http://5851759-de639796:f2ce9385-US@gate.kookeey.info:1000}
+      # 代理配置（通过 .env 或环境变量设置，不要在此处放敏感信息）
+      - BROWSER_PROXY_URL=${BROWSER_PROXY_URL:-}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       # Token 池配置（高并发优化）
       - POOL_SIZE=${POOL_SIZE:-10}
