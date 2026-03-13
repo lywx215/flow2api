@@ -33,14 +33,21 @@ PROXY_POOL_API_URL = os.environ.get("PROXY_POOL_API_URL", "")
 PROXY_POOL_REFRESH_INTERVAL = int(os.environ.get("PROXY_POOL_REFRESH_INTERVAL", "300"))  # 5min
 
 # Token 预热池配置
-POOL_SIZE = int(os.environ.get("POOL_SIZE", "10"))          # 目标维持的可用 token 数
+POOL_SIZE = int(os.environ.get("POOL_SIZE", "10"))          # 默认目标池大小
 TOKEN_TTL = int(os.environ.get("TOKEN_TTL", "90"))          # token 有效期(秒)，reCAPTCHA ~120s
-POOL_WORKERS = int(os.environ.get("POOL_WORKERS", "3"))     # 同时补充的浏览器数
+POOL_WORKERS = int(os.environ.get("POOL_WORKERS", "3"))     # 默认浏览器数
 POOL_CHECK_INTERVAL = int(os.environ.get("POOL_CHECK_INTERVAL", "5"))  # 水位检查间隔(秒)
 POOL_COOLDOWN = int(os.environ.get("POOL_COOLDOWN", "3"))              # 每批补充后冷却(秒)
 POOL_BROWSER_MAX_USES = int(os.environ.get("POOL_BROWSER_MAX_USES", "50"))  # 每个浏览器最大复用次数
 POOL_DEFAULT_PROJECT = os.environ.get("POOL_DEFAULT_PROJECT", "default_project")
 POOL_ENABLED = os.environ.get("POOL_ENABLED", "true").lower() in ("true", "1", "yes")
+
+# 动态缩放配置
+POOL_SIZE_MIN = int(os.environ.get("POOL_SIZE_MIN", "3"))       # 闲时最低池水位
+POOL_SIZE_MAX = int(os.environ.get("POOL_SIZE_MAX", "30"))      # 忙时最大池水位
+POOL_WORKERS_MIN = int(os.environ.get("POOL_WORKERS_MIN", "2")) # 最少浏览器数
+POOL_WORKERS_MAX = int(os.environ.get("POOL_WORKERS_MAX", "8")) # 最多浏览器数
+POOL_SCALE_WINDOW = int(os.environ.get("POOL_SCALE_WINDOW", "60"))  # 负载统计窗口(秒)
 
 # reCAPTCHA 配置
 WEBSITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
@@ -424,12 +431,32 @@ class PersistentBrowser:
             await self.close()
             raise
 
+    async def _simulate_human(self):
+        """模拟人类行为：随机鼠标移动+滚动，提升 reCAPTCHA 评分"""
+        if not self._page:
+            return
+        try:
+            page = self._page
+            # 随机鼠标移动 2-4 次
+            for _ in range(random.randint(2, 4)):
+                x = random.randint(100, 800)
+                y = random.randint(100, 600)
+                await page.mouse.move(x, y, steps=random.randint(5, 15))
+                await asyncio.sleep(random.uniform(0.05, 0.15))
+            # 随机滚动
+            await page.mouse.wheel(0, random.randint(-200, 200))
+            await asyncio.sleep(random.uniform(0.1, 0.3))
+        except Exception:
+            pass  # 不影响主流程
+
     async def produce_token(self, action: str = "IMAGE_GENERATION") -> Optional[Dict[str, Any]]:
         """在已加载的页面上调用 execute() 获取 token，并等待 reload/clr 回调确认"""
         async with self._lock:
             if not self.is_ready:
                 return None
             try:
+                # 模拟人类交互行为
+                await self._simulate_human()
                 # 设置 reload/clr 回调事件（每次 execute 都需要重新监听）
                 reload_ok = asyncio.Event()
                 clr_ok = asyncio.Event()
@@ -487,8 +514,8 @@ class PersistentBrowser:
                         self._ready = False
                         return None
 
-                    # 额外稳定等待
-                    await asyncio.sleep(2)
+                    # 短稳定等待（reload+clr 已确认，无需长等）
+                    await asyncio.sleep(0.5)
 
                     self._uses += 1
                     logger.info(f"[PB-{self.browser_id}] token #{self._uses} 生成成功 (reload+clr 已确认)")
@@ -527,14 +554,15 @@ class PersistentBrowser:
 
 
 class BrowserPool:
-    """管理 N 个持久化浏览器，轮询分配打码任务"""
+    """管理 N 个持久化浏览器，支持动态缩放"""
 
-    def __init__(self, size: int):
+    def __init__(self, initial_size: int):
         self._browsers: List[PersistentBrowser] = [
-            PersistentBrowser(i) for i in range(size)
+            PersistentBrowser(i) for i in range(initial_size)
         ]
         self._robin_index = 0
         self._lock = asyncio.Lock()
+        self._next_id = initial_size  # 下一个浏览器 ID
 
     async def start_all(self):
         """启动所有浏览器"""
@@ -549,10 +577,42 @@ class BrowserPool:
         ready = sum(1 for pb in self._browsers if pb.is_ready)
         logger.info(f"🌐 持久化浏览器就绪: {ready}/{len(self._browsers)}")
 
+    async def scale_to(self, target: int):
+        """动态缩放浏览器数量到 target"""
+        target = max(POOL_WORKERS_MIN, min(POOL_WORKERS_MAX, target))
+        current = len(self._browsers)
+        if target == current:
+            return
+
+        if target > current:
+            # 扩容：新增浏览器
+            for _ in range(target - current):
+                pb = PersistentBrowser(self._next_id)
+                self._next_id += 1
+                try:
+                    await pb.start()
+                    async with self._lock:
+                        self._browsers.append(pb)
+                    logger.info(f"[BrowserPool] ⬆️ 扩容: 新增 PB-{pb.browser_id}, 当前 {len(self._browsers)}")
+                except Exception as e:
+                    logger.error(f"[BrowserPool] 扩容失败: {e}")
+                    await pb.close()
+                await asyncio.sleep(1)
+        else:
+            # 缩容：关闭多余的浏览器（从末尾开始）
+            async with self._lock:
+                to_remove = self._browsers[target:]
+                self._browsers = self._browsers[:target]
+            for pb in to_remove:
+                logger.info(f"[BrowserPool] ⬇️ 缩容: 关闭 PB-{pb.browser_id}")
+                await pb.close()
+
     async def produce_token(self, action: str = "IMAGE_GENERATION") -> Optional[Dict[str, Any]]:
         """轮询选一个浏览器生产 token"""
         async with self._lock:
-            start_idx = self._robin_index
+            if not self._browsers:
+                return None
+            start_idx = self._robin_index % len(self._browsers)
             self._robin_index = (self._robin_index + 1) % len(self._browsers)
 
         # 尝试所有浏览器
@@ -579,10 +639,15 @@ class BrowserPool:
             await pb.close()
 
     @property
+    def size(self) -> int:
+        return len(self._browsers)
+
+    @property
     def status(self) -> Dict[str, Any]:
         return {
             "total": len(self._browsers),
             "ready": sum(1 for pb in self._browsers if pb.is_ready),
+            "scale_range": f"{POOL_WORKERS_MIN}-{POOL_WORKERS_MAX}",
             "browsers": [
                 {"id": pb.browser_id, "ready": pb.is_ready, "uses": pb._uses}
                 for pb in self._browsers
@@ -613,7 +678,7 @@ class PooledToken:
 
 
 class TokenPool:
-    """Token 预热池：通过持久化浏览器持续打码"""
+    """Token 预热池：动态缩放 + 负载感知 + 等待机制"""
 
     def __init__(self):
         self._tokens: List[PooledToken] = []
@@ -626,6 +691,11 @@ class TokenPool:
         self._pool_hits = 0
         self._pool_misses = 0
         self._started = False
+        # 动态缩放
+        self._target_pool_size = POOL_SIZE
+        self._request_timestamps: List[float] = []
+        # 等待机制
+        self._token_available = asyncio.Event()
 
     async def start(self):
         """启动预热池 + 持久化浏览器"""
@@ -638,11 +708,48 @@ class TokenPool:
         self._replenish_task = asyncio.create_task(self._replenish_loop())
         logger.info(
             f"🔥 Token 预热池启动 | 目标: {POOL_SIZE} | TTL: {TOKEN_TTL}s | "
-            f"持久化浏览器: {POOL_WORKERS} | 复用上限: {POOL_BROWSER_MAX_USES}"
+            f"持久化浏览器: {POOL_WORKERS} | 复用上限: {POOL_BROWSER_MAX_USES} | "
+            f"池范围: {POOL_SIZE_MIN}-{POOL_SIZE_MAX} | 浏览器范围: {POOL_WORKERS_MIN}-{POOL_WORKERS_MAX}"
         )
 
-    async def get_token(self, action: str = "IMAGE_GENERATION") -> Optional[PooledToken]:
-        """从池中取一个新鲜 token，无则返回 None"""
+    def _record_request(self):
+        """记录一次请求（用于负载统计）"""
+        now = time.time()
+        self._request_timestamps.append(now)
+        # 清理窗口外的时间戳
+        cutoff = now - POOL_SCALE_WINDOW
+        self._request_timestamps = [ts for ts in self._request_timestamps if ts > cutoff]
+
+    @property
+    def rpm(self) -> int:
+        """最近窗口内的请求数"""
+        now = time.time()
+        cutoff = now - POOL_SCALE_WINDOW
+        return sum(1 for ts in self._request_timestamps if ts > cutoff)
+
+    async def get_token(self, action: str = "IMAGE_GENERATION", timeout: float = 30) -> Optional[PooledToken]:
+        """从池中取一个新鲜 token，池空时等待最多 timeout 秒"""
+        self._record_request()
+
+        # 第一次尝试从池中取
+        token = await self._try_get(action)
+        if token:
+            return token
+
+        # 池空 → 等待新 token
+        self._pool_misses += 1
+        logger.info(f"[Pool] ⏳ 池空, 等待新 token (最多 {timeout}s)...")
+        self._token_available.clear()
+        try:
+            await asyncio.wait_for(self._token_available.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("[Pool] ⏳ 等待超时, 无可用 token")
+            return None
+
+        return await self._try_get(action)
+
+    async def _try_get(self, action: str) -> Optional[PooledToken]:
+        """尝试从池中取一个 token"""
         async with self._lock:
             before = len(self._tokens)
             self._tokens = [t for t in self._tokens if not t.is_expired]
@@ -657,7 +764,7 @@ class TokenPool:
                     self._pool_hits += 1
                     self._total_served += 1
                     logger.info(
-                        f"[Pool] ✅ 命中! 池剩余: {len(self._tokens)}/{POOL_SIZE}, "
+                        f"[Pool] ✅ 命中! 池剩余: {len(self._tokens)}/{self._target_pool_size}, "
                         f"token age: {t.age:.1f}s"
                     )
                     return t
@@ -667,22 +774,51 @@ class TokenPool:
                 self._pool_hits += 1
                 self._total_served += 1
                 logger.info(
-                    f"[Pool] ⚠️ action 不匹配但有可用 token, 池剩余: {len(self._tokens)}/{POOL_SIZE}"
+                    f"[Pool] ⚠️ action 不匹配但有可用 token, 池剩余: {len(self._tokens)}/{self._target_pool_size}"
                 )
                 return t
 
-            self._pool_misses += 1
-            return None
+        return None
 
     async def _replenish_loop(self):
-        """主循环：检查水位 → 用持久化浏览器补充 token"""
+        """主循环：动态调整 → 检查水位 → 补充 token"""
         await asyncio.sleep(2)
         while True:
             try:
+                await self._adjust_scaling()
                 await self._check_and_replenish()
             except Exception as e:
                 logger.error(f"[Pool] 补充循环异常: {type(e).__name__}: {e}")
             await asyncio.sleep(POOL_CHECK_INTERVAL)
+
+    async def _adjust_scaling(self):
+        """根据负载动态调整池大小和浏览器数量"""
+        rpm = self.rpm
+
+        if rpm <= 2:
+            # 闲时
+            target_size = POOL_SIZE_MIN
+            target_workers = POOL_WORKERS_MIN
+        elif rpm >= 10:
+            # 忙时
+            target_size = POOL_SIZE_MAX
+            target_workers = POOL_WORKERS_MAX
+        else:
+            # 中间态：线性插值
+            ratio = (rpm - 2) / 8.0  # 2-10 映射到 0-1
+            target_size = int(POOL_SIZE_MIN + ratio * (POOL_SIZE_MAX - POOL_SIZE_MIN))
+            target_workers = int(POOL_WORKERS_MIN + ratio * (POOL_WORKERS_MAX - POOL_WORKERS_MIN))
+
+        # 更新目标池大小
+        if target_size != self._target_pool_size:
+            old = self._target_pool_size
+            self._target_pool_size = target_size
+            logger.info(f"[Pool] 📊 动态调整池目标: {old} → {target_size} (RPM={rpm})")
+
+        # 动态缩放浏览器
+        if target_workers != browser_pool.size:
+            logger.info(f"[Pool] 📊 动态调整浏览器: {browser_pool.size} → {target_workers} (RPM={rpm})")
+            await browser_pool.scale_to(target_workers)
 
     async def _check_and_replenish(self):
         """检查水位并用持久化浏览器补充"""
@@ -694,11 +830,11 @@ class TokenPool:
                 self._total_expired += expired_count
             current = len(self._tokens)
 
-        deficit = POOL_SIZE - current
+        deficit = self._target_pool_size - current
         if deficit <= 0:
             return
 
-        logger.info(f"[Pool] 水位不足: {current}/{POOL_SIZE}, 需补充 {deficit} 个")
+        logger.info(f"[Pool] 水位不足: {current}/{self._target_pool_size}, 需补充 {deficit} 个")
 
         added = 0
         failed = 0
@@ -716,6 +852,8 @@ class TokenPool:
                     self._tokens.append(pooled)
                     self._total_produced += 1
                 added += 1
+                # 通知等待中的请求
+                self._token_available.set()
             else:
                 failed += 1
 
@@ -726,7 +864,7 @@ class TokenPool:
         if added > 0 or failed > 0:
             async with self._lock:
                 pool_size = len(self._tokens)
-            logger.info(f"[Pool] 补充完成: +{added} 成功, {failed} 失败, 当前: {pool_size}/{POOL_SIZE}")
+            logger.info(f"[Pool] 补充完成: +{added} 成功, {failed} 失败, 当前: {pool_size}/{self._target_pool_size}")
 
     @property
     def status(self) -> Dict[str, Any]:
@@ -734,11 +872,12 @@ class TokenPool:
         ages = [t.age for t in fresh] if fresh else []
         return {
             "enabled": POOL_ENABLED and self._started,
-            "pool_size_target": POOL_SIZE,
+            "pool_size_target": self._target_pool_size,
+            "pool_size_range": f"{POOL_SIZE_MIN}-{POOL_SIZE_MAX}",
             "available": len(fresh),
             "total_in_pool": len(self._tokens),
             "token_ttl": TOKEN_TTL,
-            "pool_workers": POOL_WORKERS,
+            "rpm": self.rpm,
             "browser_pool": browser_pool.status,
             "stats": {
                 "total_produced": self._total_produced,

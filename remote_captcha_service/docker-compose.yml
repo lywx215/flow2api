@@ -16,15 +16,21 @@ services:
       - MAX_BROWSERS=${MAX_BROWSERS:-2}
       - SESSION_TIMEOUT=${SESSION_TIMEOUT:-1800}
       # Kookeey 住宅代理网关（每次连接自动切换 IP）
-      - BROWSER_PROXY_URL=${BROWSER_PROXY_URL:-http://9433501-6b5d3a3d:73779b25-US@gate.kookeey.info:1000}
+      - BROWSER_PROXY_URL=${BROWSER_PROXY_URL:-http://5851759-de639796:f2ce9385-US@gate.kookeey.info:1000}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      # Token 池配置
+      # Token 池配置（高并发优化）
       - POOL_SIZE=${POOL_SIZE:-10}
       - TOKEN_TTL=${TOKEN_TTL:-90}
       - POOL_WORKERS=${POOL_WORKERS:-3}
-      - POOL_BROWSER_MAX_USES=${POOL_BROWSER_MAX_USES:-20}
-      - POOL_COOLDOWN=${POOL_COOLDOWN:-3}
+      - POOL_BROWSER_MAX_USES=${POOL_BROWSER_MAX_USES:-100}
+      - POOL_COOLDOWN=${POOL_COOLDOWN:-1}
       - POOL_ENABLED=${POOL_ENABLED:-true}
+      # 动态缩放配置
+      - POOL_SIZE_MIN=${POOL_SIZE_MIN:-3}
+      - POOL_SIZE_MAX=${POOL_SIZE_MAX:-30}
+      - POOL_WORKERS_MIN=${POOL_WORKERS_MIN:-2}
+      - POOL_WORKERS_MAX=${POOL_WORKERS_MAX:-8}
+      - POOL_SCALE_WINDOW=${POOL_SCALE_WINDOW:-60}
       # Xvfb 显示
       - DISPLAY=:99
       - XVFB_WHD=1920x1080x24
