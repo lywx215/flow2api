@@ -306,6 +306,7 @@ class PersistentBrowser:
         self._uses = 0
         self._lock = asyncio.Lock()
         self._fingerprint: Optional[Dict[str, Any]] = None
+        self._using_proxy = False  # 当前是否使用代理
 
     @property
     def is_ready(self) -> bool:
@@ -315,7 +316,7 @@ class PersistentBrowser:
     def needs_restart(self) -> bool:
         return self._uses >= POOL_BROWSER_MAX_USES
 
-    async def start(self):
+    async def start(self, use_proxy: bool = True):
         """启动浏览器并加载 enterprise.js（一次性）"""
         await self.close()
         try:
@@ -324,15 +325,19 @@ class PersistentBrowser:
             height = height - random.randint(0, 80)
             viewport = {"width": width, "height": height}
 
-            # 代理池优先：每个浏览器获取独立代理 IP
+            # 动态代理：根据 use_proxy 决定是否使用代理
             effective_proxy = None
-            if proxy_pool:
-                effective_proxy = await proxy_pool.get_proxy()
-                if effective_proxy:
-                    logger.info(f"[PB-{self.browser_id}] 使用代理池代理: {effective_proxy[:50]}...")
-            if not effective_proxy:
-                effective_proxy = BROWSER_PROXY_URL
+            if use_proxy:
+                if proxy_pool:
+                    effective_proxy = await proxy_pool.get_proxy()
+                    if effective_proxy:
+                        logger.info(f"[PB-{self.browser_id}] 使用代理池代理: {effective_proxy[:50]}...")
+                if not effective_proxy:
+                    effective_proxy = BROWSER_PROXY_URL
+            self._using_proxy = bool(effective_proxy)
             proxy_option = parse_proxy_url(effective_proxy) if effective_proxy else None
+            if not use_proxy:
+                logger.info(f"[PB-{self.browser_id}] 🔓 无代理模式启动（省流量）")
 
             self._playwright = await async_playwright().start()
             browser_args = [
@@ -554,7 +559,7 @@ class PersistentBrowser:
 
 
 class BrowserPool:
-    """管理 N 个持久化浏览器，支持动态缩放"""
+    """管理 N 个持久化浏览器，支持动态缩放 + 动态代理切换"""
 
     def __init__(self, initial_size: int):
         self._browsers: List[PersistentBrowser] = [
@@ -563,19 +568,39 @@ class BrowserPool:
         self._robin_index = 0
         self._lock = asyncio.Lock()
         self._next_id = initial_size  # 下一个浏览器 ID
+        self._proxy_enabled = True   # 当前是否启用代理
 
-    async def start_all(self):
+    async def start_all(self, use_proxy: bool = True):
         """启动所有浏览器"""
-        logger.info(f"🌐 启动 {len(self._browsers)} 个持久化浏览器...")
+        self._proxy_enabled = use_proxy
+        proxy_label = "代理" if use_proxy else "无代理"
+        logger.info(f"🌐 启动 {len(self._browsers)} 个持久化浏览器 ({proxy_label})...")
         for pb in self._browsers:
             try:
-                await pb.start()
+                await pb.start(use_proxy=use_proxy)
             except Exception as e:
                 logger.error(f"[BrowserPool] 浏览器 {pb.browser_id} 启动失败: {e}")
             # 间隔启动，避免 CPU 峰值
             await asyncio.sleep(2)
         ready = sum(1 for pb in self._browsers if pb.is_ready)
-        logger.info(f"🌐 持久化浏览器就绪: {ready}/{len(self._browsers)}")
+        logger.info(f"🌐 持久化浏览器就绪: {ready}/{len(self._browsers)} ({proxy_label})")
+
+    async def switch_proxy(self, enable_proxy: bool):
+        """切换所有浏览器的代理状态（需要重启所有浏览器）"""
+        if enable_proxy == self._proxy_enabled:
+            return
+        old_label = "代理" if self._proxy_enabled else "无代理"
+        new_label = "代理" if enable_proxy else "无代理"
+        logger.info(f"[BrowserPool] 🔄 代理切换: {old_label} → {new_label}, 重启所有浏览器...")
+        self._proxy_enabled = enable_proxy
+        for pb in self._browsers:
+            try:
+                await pb.start(use_proxy=enable_proxy)
+            except Exception as e:
+                logger.error(f"[BrowserPool] 重启 PB-{pb.browser_id} 失败: {e}")
+            await asyncio.sleep(1)
+        ready = sum(1 for pb in self._browsers if pb.is_ready)
+        logger.info(f"[BrowserPool] 🔄 代理切换完成: {ready}/{len(self._browsers)} ({new_label})")
 
     async def scale_to(self, target: int):
         """动态缩放浏览器数量到 target"""
@@ -590,7 +615,7 @@ class BrowserPool:
                 pb = PersistentBrowser(self._next_id)
                 self._next_id += 1
                 try:
-                    await pb.start()
+                    await pb.start(use_proxy=self._proxy_enabled)
                     async with self._lock:
                         self._browsers.append(pb)
                     logger.info(f"[BrowserPool] ⬆️ 扩容: 新增 PB-{pb.browser_id}, 当前 {len(self._browsers)}")
@@ -624,7 +649,7 @@ class BrowserPool:
             if pb.needs_restart or not pb.is_ready:
                 try:
                     logger.info(f"[BrowserPool] 重启浏览器 {pb.browser_id} (uses={pb._uses})")
-                    await pb.start()
+                    await pb.start(use_proxy=self._proxy_enabled)
                 except Exception:
                     continue
 
@@ -648,6 +673,7 @@ class BrowserPool:
             "total": len(self._browsers),
             "ready": sum(1 for pb in self._browsers if pb.is_ready),
             "scale_range": f"{POOL_WORKERS_MIN}-{POOL_WORKERS_MAX}",
+            "proxy_enabled": self._proxy_enabled,
             "browsers": [
                 {"id": pb.browser_id, "ready": pb.is_ready, "uses": pb._uses}
                 for pb in self._browsers
@@ -696,14 +722,16 @@ class TokenPool:
         self._request_timestamps: List[float] = []
         # 等待机制
         self._token_available = asyncio.Event()
+        # 成功率跟踪（用于代理切换决策）
+        self._recent_results: List[Dict] = []  # {"time": float, "ok": bool}
 
     async def start(self):
         """启动预热池 + 持久化浏览器"""
         if not POOL_ENABLED:
             logger.info("🔴 Token 预热池已禁用 (POOL_ENABLED=false)")
             return
-        # 先启动持久化浏览器
-        await browser_pool.start_all()
+        # 先启动持久化浏览器（闲时无代理启动，省流量）
+        await browser_pool.start_all(use_proxy=False)
         self._started = True
         self._replenish_task = asyncio.create_task(self._replenish_loop())
         logger.info(
@@ -726,6 +754,25 @@ class TokenPool:
         now = time.time()
         cutoff = now - POOL_SCALE_WINDOW
         return sum(1 for ts in self._request_timestamps if ts > cutoff)
+
+    @property
+    def success_rate(self) -> float:
+        """最近窗口内的 token 生产成功率"""
+        now = time.time()
+        cutoff = now - POOL_SCALE_WINDOW
+        recent = [r for r in self._recent_results if r["time"] > cutoff]
+        if not recent:
+            return 1.0  # 无数据视为正常
+        ok = sum(1 for r in recent if r["ok"])
+        return ok / len(recent)
+
+    def _record_result(self, ok: bool):
+        """记录一次 token 生产结果"""
+        now = time.time()
+        self._recent_results.append({"time": now, "ok": ok})
+        # 清理窗口外的结果
+        cutoff = now - POOL_SCALE_WINDOW * 2  # 保留更长窗口
+        self._recent_results = [r for r in self._recent_results if r["time"] > cutoff]
 
     async def get_token(self, action: str = "IMAGE_GENERATION", timeout: float = 30) -> Optional[PooledToken]:
         """从池中取一个新鲜 token，池空时等待最多 timeout 秒"""
@@ -792,8 +839,16 @@ class TokenPool:
             await asyncio.sleep(POOL_CHECK_INTERVAL)
 
     async def _adjust_scaling(self):
-        """根据负载动态调整池大小和浏览器数量"""
+        """根据负载动态调整池大小、浏览器数量和代理状态"""
         rpm = self.rpm
+        success_rate = self.success_rate
+
+        # === 代理切换决策 ===
+        # 闲时 (RPM≤2) 且成功率尚可 (≠60%) → 无代理
+        # 忙时 (RPM>2) 或成功率低 (<60%) → 启用代理
+        need_proxy = rpm > 2 or (success_rate < 0.6 and len(self._recent_results) >= 5)
+        if need_proxy != browser_pool._proxy_enabled:
+            await browser_pool.switch_proxy(need_proxy)
 
         if rpm <= 2:
             # 闲时
@@ -813,7 +868,7 @@ class TokenPool:
         if target_size != self._target_pool_size:
             old = self._target_pool_size
             self._target_pool_size = target_size
-            logger.info(f"[Pool] 📊 动态调整池目标: {old} → {target_size} (RPM={rpm})")
+            logger.info(f"[Pool] 📊 动态调整池目标: {old} → {target_size} (RPM={rpm}, 成功率={success_rate:.0%})")
 
         # 动态缩放浏览器
         if target_workers != browser_pool.size:
@@ -852,10 +907,12 @@ class TokenPool:
                     self._tokens.append(pooled)
                     self._total_produced += 1
                 added += 1
+                self._record_result(True)
                 # 通知等待中的请求
                 self._token_available.set()
             else:
                 failed += 1
+                self._record_result(False)
 
             # 小间隔，避免 CPU 峰值
             if POOL_COOLDOWN > 0:
@@ -878,6 +935,7 @@ class TokenPool:
             "total_in_pool": len(self._tokens),
             "token_ttl": TOKEN_TTL,
             "rpm": self.rpm,
+            "success_rate": f"{self.success_rate:.0%}",
             "browser_pool": browser_pool.status,
             "stats": {
                 "total_produced": self._total_produced,
