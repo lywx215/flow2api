@@ -28,6 +28,10 @@ MAX_BROWSERS = int(os.environ.get("MAX_BROWSERS", "2"))
 SESSION_TIMEOUT = int(os.environ.get("SESSION_TIMEOUT", "1800"))  # 30min
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 
+# 代理池配置（优先级高于 BROWSER_PROXY_URL）
+PROXY_POOL_API_URL = os.environ.get("PROXY_POOL_API_URL", "")
+PROXY_POOL_REFRESH_INTERVAL = int(os.environ.get("PROXY_POOL_REFRESH_INTERVAL", "300"))  # 5min
+
 # Token 预热池配置
 POOL_SIZE = int(os.environ.get("POOL_SIZE", "10"))          # 目标维持的可用 token 数
 TOKEN_TTL = int(os.environ.get("TOKEN_TTL", "90"))          # token 有效期(秒)，reCAPTCHA ~120s
@@ -133,6 +137,91 @@ def parse_proxy_url(proxy_url: str) -> Optional[Dict[str, str]]:
     return None
 
 
+# ==================== 代理池管理 ====================
+class ProxyPool:
+    """住宅代理池：从 API 批量获取旋转代理，为每个浏览器分配独立代理"""
+
+    def __init__(self, api_url: str):
+        self._api_url = api_url
+        self._proxies: List[str] = []  # 格式: http://user:pass@host:port
+        self._index = 0
+        self._lock = asyncio.Lock()
+        self._last_refresh = 0.0
+        self._refresh_interval = PROXY_POOL_REFRESH_INTERVAL
+
+    @staticmethod
+    def parse_proxy_line(line: str) -> Optional[str]:
+        """解析代理行: host:port:user:pass -> http://user:pass@host:port"""
+        line = line.strip()
+        if not line:
+            return None
+        parts = line.split(":")
+        if len(parts) == 4:
+            host, port, user, password = parts
+            return f"http://{user}:{password}@{host}:{port}"
+        elif len(parts) == 2:
+            return f"http://{parts[0]}:{parts[1]}"
+        elif len(parts) == 3:
+            return f"http://{parts[2]}@{parts[0]}:{parts[1]}"
+        return None
+
+    async def refresh(self):
+        """从 API 刷新代理列表"""
+        try:
+            import urllib.request
+            loop = asyncio.get_event_loop()
+            resp = await loop.run_in_executor(
+                None,
+                lambda: urllib.request.urlopen(self._api_url, timeout=15).read().decode("utf-8")
+            )
+            lines = resp.strip().replace("\r\n", "\n").split("\n")
+            parsed = []
+            for line in lines:
+                proxy_url = self.parse_proxy_line(line)
+                if proxy_url:
+                    parsed.append(proxy_url)
+
+            if parsed:
+                async with self._lock:
+                    self._proxies = parsed
+                    self._index = 0
+                    self._last_refresh = time.time()
+                logger.info(f"[ProxyPool] ✅ 刷新成功: {len(parsed)} 个代理")
+            else:
+                logger.warning("[ProxyPool] ⚠️ API 返回空代理列表")
+        except Exception as e:
+            logger.error(f"[ProxyPool] ❌ 刷新失败: {type(e).__name__}: {str(e)[:200]}")
+
+    async def get_proxy(self) -> Optional[str]:
+        """获取一个代理 URL (轮询分配)"""
+        if time.time() - self._last_refresh > self._refresh_interval:
+            await self.refresh()
+
+        async with self._lock:
+            if not self._proxies:
+                return None
+            proxy = self._proxies[self._index % len(self._proxies)]
+            self._index += 1
+            return proxy
+
+    @property
+    def available(self) -> int:
+        return len(self._proxies)
+
+    @property
+    def status(self) -> Dict[str, Any]:
+        return {
+            "enabled": bool(self._api_url),
+            "available": len(self._proxies),
+            "last_refresh": self._last_refresh,
+            "refresh_interval": self._refresh_interval,
+        }
+
+
+# 全局代理池实例
+proxy_pool = ProxyPool(PROXY_POOL_API_URL) if PROXY_POOL_API_URL else None
+
+
 # ==================== Session 管理 ====================
 class CaptchaSession:
     """一个打码会话，跟踪浏览器生命周期"""
@@ -228,7 +317,14 @@ class PersistentBrowser:
             height = height - random.randint(0, 80)
             viewport = {"width": width, "height": height}
 
-            effective_proxy = BROWSER_PROXY_URL
+            # 代理池优先：每个浏览器获取独立代理 IP
+            effective_proxy = None
+            if proxy_pool:
+                effective_proxy = await proxy_pool.get_proxy()
+                if effective_proxy:
+                    logger.info(f"[PB-{self.browser_id}] 使用代理池代理: {effective_proxy[:50]}...")
+            if not effective_proxy:
+                effective_proxy = BROWSER_PROXY_URL
             proxy_option = parse_proxy_url(effective_proxy) if effective_proxy else None
 
             self._playwright = await async_playwright().start()
