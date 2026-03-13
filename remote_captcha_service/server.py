@@ -586,21 +586,16 @@ class BrowserPool:
         logger.info(f"🌐 持久化浏览器就绪: {ready}/{len(self._browsers)} ({proxy_label})")
 
     async def switch_proxy(self, enable_proxy: bool):
-        """切换所有浏览器的代理状态（需要重启所有浏览器）"""
+        """切换代理模式（仅更新标记，不重启现有浏览器）
+        
+        现有浏览器在到达 MAX_USES 或出错重启时，会自动使用新的代理设置。
+        """
         if enable_proxy == self._proxy_enabled:
             return
         old_label = "代理" if self._proxy_enabled else "无代理"
         new_label = "代理" if enable_proxy else "无代理"
-        logger.info(f"[BrowserPool] 🔄 代理切换: {old_label} → {new_label}, 重启所有浏览器...")
         self._proxy_enabled = enable_proxy
-        for pb in self._browsers:
-            try:
-                await pb.start(use_proxy=enable_proxy)
-            except Exception as e:
-                logger.error(f"[BrowserPool] 重启 PB-{pb.browser_id} 失败: {e}")
-            await asyncio.sleep(1)
-        ready = sum(1 for pb in self._browsers if pb.is_ready)
-        logger.info(f"[BrowserPool] 🔄 代理切换完成: {ready}/{len(self._browsers)} ({new_label})")
+        logger.info(f"[BrowserPool] 🔄 代理模式已切换: {old_label} → {new_label}（新建/重启的浏览器将使用 {new_label}）")
 
     async def scale_to(self, target: int):
         """动态缩放浏览器数量到 target"""
@@ -876,7 +871,7 @@ class TokenPool:
             await browser_pool.scale_to(target_workers)
 
     async def _check_and_replenish(self):
-        """检查水位并用持久化浏览器补充"""
+        """检查水位并用持久化浏览器补充（每 3 个 token 重新检查缩放）"""
         async with self._lock:
             before = len(self._tokens)
             self._tokens = [t for t in self._tokens if not t.is_expired]
@@ -889,11 +884,19 @@ class TokenPool:
         if deficit <= 0:
             return
 
-        logger.info(f"[Pool] 水位不足: {current}/{self._target_pool_size}, 需补充 {deficit} 个")
+        # 每次最多补充 5 个，避免长时间阻塞缩放检查
+        batch = min(deficit, 5)
+        logger.info(f"[Pool] 水位不足: {current}/{self._target_pool_size}, 本轮补充 {batch} 个")
 
         added = 0
         failed = 0
-        for _ in range(deficit):
+        for i in range(batch):
+            # 中途重新检查目标（可能已被缩放调低）
+            async with self._lock:
+                current_count = len([t for t in self._tokens if not t.is_expired])
+            if current_count >= self._target_pool_size:
+                break
+
             result = await browser_pool.produce_token("IMAGE_GENERATION")
             if result:
                 pooled = PooledToken(
