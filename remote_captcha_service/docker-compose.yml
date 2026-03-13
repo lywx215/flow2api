@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  captcha-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: remote-captcha-service:latest
+    container_name: remote-captcha-service
+    ports:
+      - "8060:8060"
+    environment:
+      - API_KEY=${API_KEY:-fcs_default_key}
+      - PORT=8060
+      - HOST=0.0.0.0
+      - MAX_BROWSERS=${MAX_BROWSERS:-2}
+      - SESSION_TIMEOUT=${SESSION_TIMEOUT:-1800}
+      - BROWSER_PROXY_URL=${BROWSER_PROXY_URL:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DISPLAY=:99
+      - XVFB_WHD=1920x1080x24
+      - PYTHONUNBUFFERED=1
+    shm_size: "2gb"
+    restart: unless-stopped
